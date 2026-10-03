@@ -2,7 +2,6 @@ import sqlite3
 import os
 from datetime import datetime
 
-# Use persistent disk on Render
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "relay_bot.db")
@@ -28,7 +27,8 @@ def init_db():
             last_message TEXT,
             is_blocked INTEGER DEFAULT 0,
             unread_count INTEGER DEFAULT 0,
-            profile_photo TEXT
+            profile_photo TEXT,
+            is_typing INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -42,14 +42,26 @@ def init_db():
             file_url TEXT,
             thumbnail_url TEXT,
             telegram_message_id INTEGER,
-            timestamp TEXT,
+            reply_to_id INTEGER,
+            reply_to_content TEXT,
+            reply_to_type TEXT,
+            forwarded_from TEXT,
+            is_edited INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
             is_read INTEGER DEFAULT 0,
+            timestamp TEXT,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS message_map (
+            owner_msg_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            user_msg_id INTEGER,
+            db_msg_id INTEGER
         );
         
         CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
         CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_users_last ON users(last_message);
     """)
     conn.commit()
     conn.close()
@@ -72,14 +84,15 @@ def get_or_create_user(user_id, username=None, full_name=None):
             UPDATE users SET username = ?, full_name = ?, last_message = ?
             WHERE user_id = ?
         """, (username, full_name, now, user_id))
-
     conn.commit()
     conn.close()
 
 
 def save_message(user_id, direction, message_type, content=None,
                  file_id=None, file_name=None, file_url=None,
-                 thumbnail_url=None, telegram_message_id=None):
+                 thumbnail_url=None, telegram_message_id=None,
+                 reply_to_id=None, reply_to_content=None, reply_to_type=None,
+                 forwarded_from=None):
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.now().isoformat()
@@ -87,14 +100,15 @@ def save_message(user_id, direction, message_type, content=None,
     cursor.execute("""
         INSERT INTO messages 
         (user_id, direction, message_type, content, file_id, file_name, 
-         file_url, thumbnail_url, telegram_message_id, timestamp, is_read)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         file_url, thumbnail_url, telegram_message_id, reply_to_id,
+         reply_to_content, reply_to_type, forwarded_from, timestamp, is_read)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (user_id, direction, message_type, content, file_id, file_name,
-          file_url, thumbnail_url, telegram_message_id, now,
+          file_url, thumbnail_url, telegram_message_id, reply_to_id,
+          reply_to_content, reply_to_type, forwarded_from, now,
           1 if direction == 'outgoing' else 0))
 
     cursor.execute("UPDATE users SET last_message = ? WHERE user_id = ?", (now, user_id))
-
     if direction == 'incoming':
         cursor.execute("UPDATE users SET unread_count = unread_count + 1 WHERE user_id = ?", (user_id,))
 
@@ -109,8 +123,9 @@ def get_all_users():
     cursor = conn.cursor()
     cursor.execute("""
         SELECT u.*, 
-               (SELECT content FROM messages WHERE user_id = u.user_id ORDER BY timestamp DESC LIMIT 1) as last_content,
-               (SELECT message_type FROM messages WHERE user_id = u.user_id ORDER BY timestamp DESC LIMIT 1) as last_type
+               (SELECT content FROM messages WHERE user_id = u.user_id AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 1) as last_content,
+               (SELECT message_type FROM messages WHERE user_id = u.user_id AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 1) as last_type,
+               (SELECT direction FROM messages WHERE user_id = u.user_id AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 1) as last_direction
         FROM users u 
         ORDER BY u.last_message DESC
     """)
@@ -128,11 +143,11 @@ def get_user(user_id):
     return dict(row) if row else None
 
 
-def get_messages(user_id, limit=200):
+def get_messages(user_id, limit=500):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT * FROM messages WHERE user_id = ? 
+        SELECT * FROM messages WHERE user_id = ? AND is_deleted = 0
         ORDER BY timestamp ASC LIMIT ?
     """, (user_id, limit))
     messages = [dict(row) for row in cursor.fetchall()]
@@ -140,11 +155,33 @@ def get_messages(user_id, limit=200):
     return messages
 
 
-def mark_as_read(user_id):
+def get_message_by_id(msg_id):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE messages SET is_read = 1 WHERE user_id = ? AND direction = 'incoming'", (user_id,))
-    cursor.execute("UPDATE users SET unread_count = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT * FROM messages WHERE id = ?", (msg_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def edit_message(msg_id, new_content):
+    conn = get_db()
+    conn.execute("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ?", (new_content, msg_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_message(msg_id):
+    conn = get_db()
+    conn.execute("UPDATE messages SET is_deleted = 1 WHERE id = ?", (msg_id,))
+    conn.commit()
+    conn.close()
+
+
+def mark_as_read(user_id):
+    conn = get_db()
+    conn.execute("UPDATE messages SET is_read = 1 WHERE user_id = ? AND direction = 'incoming'", (user_id,))
+    conn.execute("UPDATE users SET unread_count = 0 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -184,7 +221,7 @@ def get_total_stats():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) as c FROM users")
     total_users = cursor.fetchone()['c']
-    cursor.execute("SELECT COUNT(*) as c FROM messages")
+    cursor.execute("SELECT COUNT(*) as c FROM messages WHERE is_deleted = 0")
     total_messages = cursor.fetchone()['c']
     cursor.execute("SELECT COUNT(*) as c FROM users WHERE is_blocked = 1")
     blocked_users = cursor.fetchone()['c']
@@ -205,8 +242,8 @@ def search_users(query):
     q = f'%{query}%'
     cursor.execute("""
         SELECT u.*, 
-               (SELECT content FROM messages WHERE user_id = u.user_id ORDER BY timestamp DESC LIMIT 1) as last_content,
-               (SELECT message_type FROM messages WHERE user_id = u.user_id ORDER BY timestamp DESC LIMIT 1) as last_type
+               (SELECT content FROM messages WHERE user_id = u.user_id AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 1) as last_content,
+               (SELECT message_type FROM messages WHERE user_id = u.user_id AND is_deleted = 0 ORDER BY timestamp DESC LIMIT 1) as last_type
         FROM users u 
         WHERE u.full_name LIKE ? OR u.username LIKE ? OR CAST(u.user_id AS TEXT) LIKE ?
         ORDER BY u.last_message DESC
@@ -221,3 +258,36 @@ def save_user_profile_photo(user_id, photo_url):
     conn.execute("UPDATE users SET profile_photo = ? WHERE user_id = ?", (photo_url, user_id))
     conn.commit()
     conn.close()
+
+
+def save_message_map(owner_msg_id, user_id, user_msg_id=None, db_msg_id=None):
+    conn = get_db()
+    conn.execute("""
+        INSERT OR REPLACE INTO message_map (owner_msg_id, user_id, user_msg_id, db_msg_id)
+        VALUES (?, ?, ?, ?)
+    """, (owner_msg_id, user_id, user_msg_id, db_msg_id))
+    conn.commit()
+    conn.close()
+
+
+def get_mapped_user(owner_msg_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM message_map WHERE owner_msg_id = ?", (owner_msg_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_db_msg_from_tg(user_id, tg_msg_id):
+    """Get DB message id from telegram message id."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM messages 
+        WHERE user_id = ? AND telegram_message_id = ? AND is_deleted = 0
+        LIMIT 1
+    """, (user_id, tg_msg_id))
+    row = cursor.fetchone()
+    conn.close()
+    return row['id'] if row else None
